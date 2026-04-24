@@ -5,7 +5,7 @@
 A reproducible recipe for serving [`Lorbus/Qwen3.6-27B-int4-AutoRound`](https://huggingface.co/Lorbus/Qwen3.6-27B-int4-AutoRound) on a single consumer 24 GB RTX 3090, via vLLM with MTP speculative decoding + TurboQuant 3-bit KV cache. Built on top of [`Sandermage/genesis-vllm-patches`](https://github.com/Sandermage/genesis-vllm-patches) plus a CUDA graph capture fix for vLLM's TurboQuant backend that ships in this repo.
 
 > 📖 **Full write-up:** *[Qwen3.6-27B on a single RTX 3090 — the recipe](https://medium.com/)*  *(replace with live URL after publishing)*
-> 🐛 **Upstream bug report:** `vllm-project/vllm#TBD` *(filed after this repo goes public)*
+> 🐛 **Upstream bug report:** [vllm-project/vllm#40807](https://github.com/vllm-project/vllm/issues/40807)
 
 ---
 
@@ -244,7 +244,7 @@ qwen36-27b-single-3090/
 
 ## Upstream status
 
-- vLLM issue: tracked under [#40069](https://github.com/vllm-project/vllm/issues/40069) (TurboQuant/HIGGS follow-ups). Our specific `.tolist()` bug filed as #TBD (updated once live).
+- vLLM issue: tracked under [#40069](https://github.com/vllm-project/vllm/issues/40069) (TurboQuant/HIGGS follow-ups). Our specific `.tolist()` bug is filed as [#40807](https://github.com/vllm-project/vllm/issues/40807).
 - vLLM PR: not yet submitted — our disk-edit is the short-term workaround.
 - Sandermage Genesis: we may contribute `patch_tolist_cudagraph.py` upstream as a new patch in their unified script.
 - Lorbus HF discussion: caveat about the Ampere cudagraph requirement posted at TBD.
