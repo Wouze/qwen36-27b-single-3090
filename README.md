@@ -184,21 +184,43 @@ Expected numbers on a stock 3090 at 230W:
 
 ---
 
-## Known issues
+## Known issue: tool calling × MTP × TurboQuant KV
 
-### Tool calling is broken in the default shipped config (investigating)
+**Status:** diagnosed 2026-04-24 via a compose sweep, fix available via alternate compose file.
 
-**Status:** confirmed 2026-04-24 via `scripts/verify.sh`.
+### Symptom
 
-**Symptom:** requests with a `tools: [...]` array return degenerate output — `<tool_call>` repeated until max_tokens, empty `tool_calls[]`, sometimes `I I I I` token loops. Run `scripts/verify.sh` to confirm this is what you're hitting.
+Requests with a `tools: [...]` array produce degenerate output — `<tool_call>` repeated hundreds of times with no JSON body, sometimes `I I I I` token loops. The `tool_calls[]` field in the response stays empty. Run `scripts/verify.sh` to detect.
 
-**Root cause:** not the Genesis tool_call fix (that applies correctly). MTP speculative decoding's draft acceptance collapses to 0% on tool-call-shaped prompts, and the main model's own samples also degenerate. Appears to be a quantization × spec-dec × prompt-class interaction, not a patch bug.
+### Root cause
 
-**What works:** text-only completion ✅, vision ✅, long context ✅. Only tool calling is affected.
+Not the Genesis tool_call fix (that applies correctly), not a model weight issue. **MTP speculative decoding × any TurboQuant KV preset** is incompatible on tool-schema prompts. Other prompt classes (narrative, code, vision, long context) are fine; only structured tool-call prompts trigger the collapse.
 
-**Investigation in progress** — we're running a sweep to isolate which component (MTP draft / turboquant_3bit_nc KV / AutoRound weights) is at fault, then will either ship a fixed config or document the workaround here. Follow commits + issues on this repo.
+Sweep results (MTP n=3 in all tests where MTP is on):
 
-**In the meantime** — if your app needs tool calls, either (a) use a different model temporarily, or (b) strip the `tools: [...]` param and handle tool invocation prompting-only without the structured API.
+| KV preset | Tools work? |
+|---|---|
+| `fp8_e5m2` | ✅ |
+| `turboquant_3bit_nc` | ❌ |
+| `turboquant_4bit_nc` | ❌ |
+| `turboquant_k8v4` (no norm correction) | ❌ |
+| Any TurboQuant, MTP **disabled** | ✅ |
+
+The MTP draft head's attention computation interacts badly with TurboQuant's KV storage format on out-of-distribution token sequences. Draft acceptance collapses to 0%, and the main model's own samples also degenerate (probably because earlier garbage tokens contaminate the context).
+
+### Pick a variant based on what you need
+
+| If you need... | Use | Ctx | TPS | Tools |
+|---|---|---|---|---|
+| **Max context + vision, no tools** (the article's headline) | `docker compose up -d` (default `docker-compose.yml`) | **125K** | **85/106** | ❌ |
+| **Tool calling + reasonable speed** | `docker compose -f docker-compose.tools.yml up -d` | 20K | 63/80 | ✅ |
+| **Tool calling + max context (slower)** | Copy `docker-compose.tools.yml`, set `--kv-cache-dtype turboquant_3bit_nc`, set `--max-model-len 125000`, remove the `--speculative-config` line | 125K | ~40-50 | ✅ |
+
+Only one container can bind to port 8020 — `docker compose down` before switching.
+
+### Upstream-bug potential
+
+This looks like a real vLLM/TurboQuant bug — MTP and TurboQuant should compose correctly regardless of prompt class. Likely to be filed upstream after a second round of validation (reproduces independently of our patch, on plain `vllm/vllm-openai:nightly` with Genesis). Watch the repo for updates.
 
 ---
 
