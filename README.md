@@ -1,36 +1,73 @@
 # Qwen3.6-27B on a single RTX 3090
 
-**92 TPS narrative · 95 TPS code · 125K context · vision enabled · 230W cap**
+**A validated recipe for serving Qwen3.6-27B on a single consumer 24 GB RTX 3090** — full OpenAI API, vision, tool calling, streaming, speculative decoding, all verified end-to-end via `scripts/verify-full.sh`.
 
-A reproducible recipe for serving [`Lorbus/Qwen3.6-27B-int4-AutoRound`](https://huggingface.co/Lorbus/Qwen3.6-27B-int4-AutoRound) on a single consumer 24 GB RTX 3090, via vLLM with MTP speculative decoding + TurboQuant 3-bit KV cache. Built on top of [`Sandermage/genesis-vllm-patches`](https://github.com/Sandermage/genesis-vllm-patches) plus a CUDA graph capture fix for vLLM's TurboQuant backend that ships in this repo.
+Based on [`Lorbus/Qwen3.6-27B-int4-AutoRound`](https://huggingface.co/Lorbus/Qwen3.6-27B-int4-AutoRound) via vLLM with MTP speculative decoding + fp8_e5m2 KV cache. Built on [`Sandermage/genesis-vllm-patches`](https://github.com/Sandermage/genesis-vllm-patches) + a CUDA graph capture fix that ships in this repo.
 
-> 📖 **Full write-up:** *[Qwen3.6-27B on a single RTX 3090 — the recipe](https://medium.com/)*  *(replace with live URL after publishing)*
+> 📖 **Write-up:** *[Qwen3.6-27B on a single RTX 3090 — the recipe](https://medium.com/)*
 > 🐛 **Upstream bug report:** [vllm-project/vllm#40807](https://github.com/vllm-project/vllm/issues/40807)
 
 ---
 
-## The numbers
+## ⚠ About the 125K context headline
 
-```
-  Qwen3.6-27B on 1× RTX 3090 (24 GB, 230W cap)
-  ─────────────────────────────────────────────
-  Throughput      92 TPS (narrative)  /  95 TPS (code, peak 96)
-  Context          125 K tokens (KV pool 198K)
-  Vision           Enabled (MoonViT BF16)
-  VRAM            21.3 / 24 GB
-  Server          vLLM · full OpenAI API
-  Tools           ✅    Prefix cache  ✅
-  Spec-decode    MTP n=3 · AL 3.4–3.8 · accept 97/95/91%
-```
+The [original write-up](https://medium.com/) reported 85–106 TPS at **125K context** using TurboQuant KV cache. Under broader functional testing since publication, we found that **MTP × TurboQuant KV has output-quality issues** on prompts that require structured or exact output:
 
-For comparison:
+- Tool calls: `<tool_call>` token loops, empty `tool_calls[]`
+- Long-context recall: model outputs first token then loops (`amber amber amber...`)
+- Streaming: occasional degenerate loops on some free-form completions
 
-| Config | Narrative TPS | Code TPS | Context |
+The 125K **KV pool** fits; the **attention output quality** is unreliable under that config. Short narrative/code completions (what the benchmark measured) work fine; anything requiring recall or structured output doesn't.
+
+**TurboQuant KV is a genuinely frontier-level KV compression.** It's been in vLLM mainline for only weeks, inference engines haven't fully caught up to its edge cases yet, and the MTP interaction we hit is one such edge. We've filed upstream and are documenting what works today.
+
+**This repo's *default* config is now what we validated end-to-end:** MTP n=3 + **fp8_e5m2 KV** (not TurboQuant) + vision — 20K ctx, tools + streaming + recall all working. The 125K TurboQuant config is still available as `docker-compose.longctx-experimental.yml` for users who want the original headline behavior and understand the caveats.
+
+---
+
+## Evidence matrix — what works on each config
+
+Measured on 1× RTX 3090 at 230W cap, vLLM image pinned to tested digest, `scripts/verify-full.sh`:
+
+| Test | Default (MTP + fp8) | `tools-text.yml` (MTP + fp8 + no vision) | `longctx-experimental.yml` (MTP + turboquant) |
 |---|---|---|---|
-| vLLM + fp8 KV + MTP n=3 (earlier 3090 config) | 63.8 | 79.7 | 20 K |
-| [Lorbus card reference](https://huggingface.co/Lorbus/Qwen3.6-27B-int4-AutoRound) (RTX 5090) | ~60 | ~60 | 262 K |
-| **This repo (1× RTX 3090)** | **91.9 mean / 95.3 peak** | **94.6 mean / 95.9 peak** | **125 K** |
-| llama.cpp mainline + q4_0 KV (single-card long-ctx fallback) | 28.5 | 28.4 | 262 K |
+| Server + Genesis patches | ✅ | ✅ | ✅ |
+| Basic completion (Paris) | ✅ | ✅ | ✅ |
+| **Tool calling** | **✅** | **✅** | ❌ `<tool_call>` loops |
+| **Streaming (SSE)** | **✅** clean output | **✅** clean output | ❌ degenerate loops on some prompts |
+| Thinking / reasoning | ✅ | ✅ | ✅ (slow to finish — Qwen3 is verbose) |
+| **Long-context recall** (10K) | **✅** | **✅** | ❌ first token + loop |
+| Long-context recall (30K) | n/a (20K cap) | **✅** | ❌ |
+| Long-context recall (60K) | n/a | **✅** | ❌ |
+| Short-prompt TPS (narr / code) | 65.9 / 84.4 | 65.2 / 83.8 | 91.9 / 94.6 |
+| Peak TPS | 85 | 85 | 96 |
+| Max context | 20K | **75K** | 125K (KV pool, attention unreliable) |
+| Vision | ✅ | ❌ | ✅ |
+| VRAM | 22.8 GB | 22.2 GB | 22.0 GB |
+
+**Root cause of the ❌ cells:** MTP speculative decoding combined with any TurboQuant KV preset (tested `turboquant_3bit_nc`, `turboquant_4bit_nc`, `turboquant_k8v4`; also tested MTP n=1, 2, 3, 4) produces degenerate token loops. Either MTP alone (on fp8 KV) or TurboQuant alone (MTP off) works fine — only the combination fails. Upstream bug to be filed as a follow-up to [#40807](https://github.com/vllm-project/vllm/issues/40807).
+
+---
+
+## Production numbers — default config
+
+```
+  Qwen3.6-27B on 1× RTX 3090 (24 GB, 230W cap, default config)
+  ────────────────────────────────────────────────────────────
+  Throughput      66 TPS (narrative)  /  84 TPS (code, peak 85)
+  Context          20 K tokens
+  Vision           Enabled (MoonViT BF16)
+  VRAM            22.8 / 24 GB
+  Server          vLLM · full OpenAI API
+  Tools           ✅ working   Streaming ✅   Thinking ✅
+  Spec-decode    MTP n=3 · AL 2.87–3.39 · accept 94/81/64%
+```
+
+Beats [Lorbus card's RTX 5090 baseline](https://huggingface.co/Lorbus/Qwen3.6-27B-int4-AutoRound) (~60 TPS) on consumer Ampere hardware. All functionality verified.
+
+For higher TPS at the cost of broken tools and unreliable recall, see `docker-compose.longctx-experimental.yml` (92/95 TPS, 125K ctx pool, quality caveats documented in file header).
+
+For more context without vision (text-only agents), see `docker-compose.tools-text.yml` (75K ctx, same TPS).
 
 ---
 
@@ -180,60 +217,48 @@ Expected numbers on a stock 3090 at 230W:
 | narrative (warmed) | 10–16 s | 60–105 |
 | code (warmed) | 8–12 s | 60–100 |
 
-**High variance is normal** — MTP acceptance dips cause individual requests to drop into the 60–70 TPS range. Mean over 3+ runs is the honest number (~85 TPS).
+**High variance on the experimental 125K config is normal** — MTP acceptance dips cause individual requests to drop into the 60–70 TPS range on the TurboQuant variant. Default + tools-text are much more consistent (fp8 KV doesn't have the same variance profile).
 
 ---
 
-## Known issue: tool calling × MTP × TurboQuant KV
+## Pick a compose variant
 
-**Status:** diagnosed 2026-04-24 via a compose sweep, fix available via alternate compose file.
+| Workload | Compose file | Context |
+|---|---|---|
+| **Default — vision + tools + 20K** (validated end-to-end) | `docker-compose.yml` | 20K |
+| **Text-only agents + 75K ctx** (drops vision) | `docker-compose.tools-text.yml` | 75K |
+| **⚠ Experimental — 125K pool, TurboQuant-only** (tools broken, recall loops) | `docker-compose.longctx-experimental.yml` | 125K KV pool |
 
-### Symptom
+Only one container can bind to port 8020 at a time — `docker compose down` before switching.
 
-Requests with a `tools: [...]` array produce degenerate output — `<tool_call>` repeated hundreds of times with no JSON body, sometimes `I I I I` token loops. The `tool_calls[]` field in the response stays empty. Run `scripts/verify.sh` to detect.
+All three compose files use the same pinned vLLM image digest, the same Genesis patches, and the same MTP n=3 spec-decode. The only differences are `--kv-cache-dtype`, `--max-model-len`, and whether `--language-model-only` is set.
 
-### Root cause
+---
 
-Not the Genesis tool_call fix (that applies correctly), not a model weight issue. **MTP speculative decoding × any TurboQuant KV preset** is incompatible on tool-schema prompts. Other prompt classes (narrative, code, vision, long context) are fine; only structured tool-call prompts trigger the collapse.
+## Technical background — why turboquant is on the experimental shelf
 
-Sweep results (MTP n=3 in all tests where MTP is on):
+**TurboQuant KV is frontier-level.** It landed in vLLM mainline only weeks before this repo was published and is still under active development. The MTP×TurboQuant interaction we hit is one of several compatibility edges that upstream is still working through (see vLLM's tracking issue [#40069](https://github.com/vllm-project/vllm/issues/40069) — "Speculative decoding / Eagle" and "Hybrid attention models" are both still unchecked).
 
-| KV preset | Tools work? |
-|---|---|
-| `fp8_e5m2` | ✅ |
-| `turboquant_3bit_nc` | ❌ |
-| `turboquant_4bit_nc` | ❌ |
-| `turboquant_k8v4` (no norm correction) | ❌ |
-| Any TurboQuant, MTP **disabled** | ✅ |
+What we observed:
 
-The MTP draft head's attention computation interacts badly with TurboQuant's KV storage format on out-of-distribution token sequences. Draft acceptance collapses to 0%, and the main model's own samples also degenerate (probably because earlier garbage tokens contaminate the context).
+| MTP | KV | Structured outputs |
+|---|---|---|
+| n=3 | `turboquant_3bit_nc` | degenerate token loops |
+| n=3 | `turboquant_4bit_nc` | same |
+| n=3 | `turboquant_k8v4` (no norm correction) | same |
+| n=1 | `turboquant_3bit_nc` | same — not N-dependent |
+| **off** | any turboquant preset | **works** |
+| **n=3** | **`fp8_e5m2`** | **works** |
 
-### Pick a variant based on what you need
+Both components alone are fine. Only the combination fails. The MTP draft head's attention computation depends on KV cache precision in a way turboquant's storage format distorts for OOD tokens; normal text averages the error out, structured output can't.
 
-All four benched on a single RTX 3090 at 230W cap, vLLM image pinned to the tested digest, 3× warmup + 3× narrative (1000 tok) + 2× code (800 tok) runs.
+**What we're doing about it:**
 
-| If you need... | Use | Ctx | Narr TPS | Code TPS | Tools | Vision |
-|---|---|---|---|---|---|---|
-| **Max context + vision, no tools** (the article's headline) | `docker compose up -d` (default `docker-compose.yml`) | **125K** | **91.9** | **94.6** (peak 95.9) | ❌ | ✅ |
-| **Tools + vision** | `docker compose -f docker-compose.tools.yml up -d` | 20K | 65.9 | 84.4 (peak 85.2) | ✅ | ✅ |
-| **Tools + long-ctx, text-only** ⭐ (new) | `docker compose -f docker-compose.tools-text.yml up -d` | **75K** | 65.2 | 83.8 (peak 85.0) | ✅ | ❌ |
-| **Tools + max context (slower, keeps vision)** | Copy `docker-compose.tools.yml`, set `--kv-cache-dtype turboquant_3bit_nc`, set `--max-model-len 125000`, remove the `--speculative-config` line | 125K | 39.8 | 39.7 | ✅ | ✅ |
+- Filed upstream (cudagraph side): [vllm-project/vllm#40807](https://github.com/vllm-project/vllm/issues/40807)
+- Additional upstream filing in progress for the output-quality issue (separate from #40807)
+- The repo's default will stay on fp8_e5m2 until upstream has a tested fix
 
-**Quick picker:**
-- Need vision + tools? → `tools.yml` (20K)
-- Need tools, no vision? → `tools-text.yml` (75K, same speed)
-- Need everything including 125K? → documented no-MTP workaround (~40 TPS)
-- No tools, want headline numbers? → default (125K, 92/95)
-
-**Interpreting the code/narr split:** configs with MTP spec-decode produce faster code than narrative (code is more predictable → higher MTP accept → more tokens per verify step). Without MTP, the two converge around 40 TPS because decode is no longer draft-accelerated.
-
-Only one container can bind to port 8020 — `docker compose down` before switching.
-
-Measured 2026-04-24 on `vllm/vllm-openai@sha256:9bba4628a3b9...` (digest pinned in all compose files).
-
-### Upstream-bug potential
-
-This looks like a real vLLM/TurboQuant bug — MTP and TurboQuant should compose correctly regardless of prompt class. Likely to be filed upstream after a second round of validation (reproduces independently of our patch, on plain `vllm/vllm-openai:nightly` with Genesis). Watch the repo for updates.
+When TurboQuant gets proper MTP compatibility in mainline, the default will swap back to a long-ctx config and we'll update this README + article accordingly. Until then, treat anything related to TurboQuant KV on Ampere + hybrid models as cutting-edge with real rough edges.
 
 ---
 
@@ -268,24 +293,24 @@ You probably have `--compilation-config.cudagraph_mode=none` somewhere. Remove i
 
 ### Tool calls return `<tool_call>{...}</tool_call>` as plain text (tool extraction doesn't fire)
 
-Check container logs for this line from the Genesis patcher:
+Two possible causes; the logs distinguish them:
+
+**Cause A — you're running the experimental compose** (`docker-compose.longctx-experimental.yml`). Tool calls are **known broken** on that config due to MTP × TurboQuant KV incompatibility. See the "Technical background" section above and the file header of the experimental compose. The fix is to use the default `docker-compose.yml` (or `docker-compose.tools-text.yml` if you need more context).
+
+**Cause B — Genesis patch anchor drift.** Check container logs for:
 
 ```
 [11/17] Qwen3 <tool_call> implicit reasoning end (PR #35687)...
   [FAILED] Qwen3 tool_call fix
 ```
 
-If you see `[FAILED]`, you're running a vLLM nightly that drifted past the anchor Genesis Patch 12 expects. Qwen3 emits `<think>...<tool_call>{...}</tool_call>` often **without** closing `</think>` first; without the patch, the reasoning parser eats the whole output as reasoning and never extracts the tool call → client sees `<tool_call>` as literal text.
-
-**Fix:** pin the image to the exact nightly we tested (already pinned by default in `compose/docker-compose.yml`):
+If you see `[FAILED]`, your vLLM image drifted past the anchor Genesis Patch 12 expects. Pin to our tested digest (already pinned by default in all compose files):
 
 ```yaml
 image: vllm/vllm-openai@sha256:9bba4628a3b943e0dd33caefb94b811569ba1e97bdf23bee19a265c31b947ccb
 ```
 
-On that digest (vLLM `0.19.2rc1.dev21+g893611813`, built 2026-04-20), all four Qwen3 tool-call sub-patches apply cleanly — look for `[OK] Qwen3 tool_call fix` in the logs to confirm.
-
-If you need the floating `:nightly` tag for other reasons, verify the patch applied before trusting tool calls. You can force-replay the patch against a fresh container to see which anchor drifted:
+On that digest (vLLM `0.19.2rc1.dev21+g893611813`, built 2026-04-20), all four Qwen3 tool-call sub-patches apply cleanly — look for `[OK] Qwen3 tool_call fix`. To verify patch applicability against any image:
 
 ```bash
 docker run --rm --entrypoint python3 vllm/vllm-openai:nightly \
@@ -298,17 +323,21 @@ docker run --rm --entrypoint python3 vllm/vllm-openai:nightly \
 
 ```
 qwen36-27b-single-3090/
-├── README.md                            (this file)
-├── LICENSE                              Apache-2.0
+├── README.md                                   (this file)
+├── LICENSE                                     Apache-2.0
 ├── .gitignore
 ├── patches/
-│   ├── patch_tolist_cudagraph.py        our CUDA graph capture fix
-│   └── genesis/                         (gitignored; fetched by setup.sh)
+│   ├── patch_tolist_cudagraph.py               our CUDA graph capture fix
+│   └── genesis/                                (gitignored; fetched by setup.sh)
 ├── compose/
-│   └── docker-compose.yml               T5 production config
+│   ├── docker-compose.yml                      DEFAULT — MTP + fp8 + vision, 20K
+│   ├── docker-compose.tools-text.yml           text-only, 75K ctx
+│   └── docker-compose.longctx-experimental.yml 125K pool — ⚠ quality caveats in file
 └── scripts/
-    ├── setup.sh                         clone Genesis + download model + SHA verify
-    └── bench.sh                         canonical TPS bench
+    ├── setup.sh                                clone Genesis + download model + SHA verify
+    ├── verify.sh                               quick smoke test (~10 sec)
+    ├── verify-full.sh                          full functional test — streaming, thinking, needle (~3 min)
+    └── bench.sh                                canonical TPS bench
 ```
 
 ---

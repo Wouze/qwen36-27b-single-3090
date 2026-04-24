@@ -1,21 +1,23 @@
 # ===========================================================================
-# Text-only tools variant — use this if you need tool calling AND more than
-# 20K context, but don't need vision/image inputs.
+# Text-only extended-context variant — use this if you need more than 20K
+# context and don't need vision/image inputs.
 #
-# Compared to docker-compose.tools.yml (the with-vision variant), this drops
-# the MoonViT encoder (saves ~0.86 GB VRAM) and spends that budget on KV
-# cache → context grows from 20K to 75K with the same throughput.
+# Compared to the default docker-compose.yml (which has vision enabled at
+# 20K ctx), this drops the MoonViT vision encoder (saves ~0.86 GB VRAM)
+# and spends that budget on KV cache → context grows from 20K to 75K with
+# the same throughput.
 #
 # Variant matrix:
 #
-#   Variant              Max ctx   Narr TPS   Code TPS   Tools   Vision
-#   ─────────────────────────────────────────────────────────────────────
-#   default               125K       91.9       94.6       ❌       ✅
-#   tools (with vision)    20K       65.9       84.4       ✅       ✅
-#   tools-text (this)      75K       65.2       83.8       ✅       ❌
-#   no-MTP (125K+tools)   125K       39.8       39.7       ✅       ✅
+#   Compose file                                Max ctx   Narr   Code   Tools   Vision
+#   docker-compose.yml                            20K      66     84     ✅      ✅
+#   docker-compose.tools-text.yml (this file)     75K      65     84     ✅      ❌
+#   docker-compose.longctx-experimental.yml      125K      92     95     ✗       ✅ ⚠
 #
-# If you need ALL of (tools, max ctx, vision) → no-MTP path; expect ~40 TPS.
+# All three use MTP n=3. This and the default use fp8_e5m2 KV (validated
+# end-to-end via verify-full.sh). The experimental variant uses TurboQuant
+# KV for higher KV pool capacity but has output quality issues — see
+# docker-compose.longctx-experimental.yml header for details.
 #
 # Run with:
 #   cd compose

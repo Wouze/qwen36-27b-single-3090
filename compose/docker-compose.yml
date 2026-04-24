@@ -1,21 +1,30 @@
-# Qwen3.6-27B serving config: single RTX 3090, 125K context, vision + MTP.
+# ===========================================================================
+# Default — the config we recommend for general use.
 #
-# Before running: `bash ../scripts/setup.sh` to fetch Genesis patches and
-# download + SHA-verify the Lorbus model.
+# This config PASSES every test in scripts/verify-full.sh:
+#   server  genesis  Paris  tool-calls  streaming  thinking  needle-recall
 #
-# To pin to a specific GPU (if you have multiple), uncomment CUDA_VISIBLE_DEVICES
-# in the environment section below.
+# Config: MTP spec-decode n=3 + fp8_e5m2 KV + vision enabled.
 #
-# Model dir override: set MODEL_DIR env var (default: ./models), e.g.
-#   MODEL_DIR=/mnt/models docker compose up -d
+# Variant matrix (all three compose files in this dir):
+#
+#   Compose file                               Max ctx   Narr TPS   Code TPS   Tools   Vision   Status
+#   docker-compose.yml (this file, default)     20K        66         84         ✅       ✅       validated
+#   docker-compose.tools-text.yml                75K        65         84         ✅       ❌       validated
+#   docker-compose.longctx-experimental.yml    125K        92         95         ✗        ✅       ⚠ see file
+#
+# The experimental variant uses TurboQuant KV to fit a 125K KV pool, which
+# benchmarks faster but fails on tool calls, long-context recall, and some
+# structured-output tasks (degenerate token loops). See the file header of
+# docker-compose.longctx-experimental.yml and README § Known issues.
+#
+# Run with:
+#   cd compose
+#   docker compose up -d
+# ===========================================================================
 services:
   vllm-qwen36-27b:
     # Pinned to the exact nightly we tested and the Genesis patches verified against.
-    # Unpinning (just `vllm/vllm-openai:nightly`) may work but isn't guaranteed —
-    # if a newer nightly changes qwen3_reasoning_parser.py formatting, Genesis
-    # Patch 12 (Qwen3 tool_call fix) logs [FAILED] and tool calling silently
-    # breaks (model emits <tool_call>...</tool_call> as plain text instead of
-    # populating tool_calls[] in the API response).
     image: vllm/vllm-openai@sha256:9bba4628a3b943e0dd33caefb94b811569ba1e97bdf23bee19a265c31b947ccb
     container_name: vllm-qwen36-27b
     restart: "no"
@@ -72,15 +81,16 @@ services:
       - --tensor-parallel-size
       - "1"
       - --max-model-len
-      - "125000"
+      - "20000"
       - --gpu-memory-utilization
-      - "0.97"
+      - "0.95"
       - --max-num-seqs
       - "1"
       - --max-num-batched-tokens
-      - "4128"
+      - "2048"
+      # fp8_e5m2 KV — NOT turboquant — because MTP + turboquant collapses on tool-call prompts.
       - --kv-cache-dtype
-      - turboquant_3bit_nc
+      - fp8_e5m2
       - --trust-remote-code
       - --reasoning-parser
       - qwen3
@@ -89,7 +99,6 @@ services:
       - qwen3_coder
       - --enable-prefix-caching
       - --enable-chunked-prefill
-      - --no-scheduler-reserve-full-isl
       - --speculative-config
       - '{"method":"mtp","num_speculative_tokens":3}'
       - --host

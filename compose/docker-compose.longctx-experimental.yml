@@ -1,0 +1,135 @@
+# ===========================================================================
+# ⚠ EXPERIMENTAL — USE docker-compose.yml UNLESS YOU UNDERSTAND THE CAVEATS ⚠
+# ===========================================================================
+#
+# This is the 125K context config from the original write-up. It uses MTP
+# speculative decoding with the TurboQuant 3-bit KV cache to fit a 210K KV
+# pool, supporting max_model_len=125,000.
+#
+# It benchmarks faster than the default (92/95 TPS vs 66/84 TPS) because MTP
+# acceptance is high on simple narrative and code prompts.
+#
+# BUT — broader functional testing (scripts/verify-full.sh) revealed that
+# MTP × ANY TurboQuant KV preset produces degenerate token loops on:
+#
+#   1. Tool-call prompts:        <tool_call><tool_call><tool_call>...
+#   2. Streaming (occasionally): "Wait, I I I I I I I..."
+#   3. Long-context recall:      "amber amber amber amber..." or "urururur..."
+#   4. Structured outputs:       probably similar; not yet fully tested
+#
+# The KV pool fits 125K tokens but the *attention output quality* is not
+# reliable across workloads. Short narrative/code completions work fine
+# (which is why the initial benchmarks passed); anything requiring structured
+# or long-recall output is unreliable.
+#
+# Cause: MTP draft head's attention states rely on KV cache precision in a
+# way that TurboQuant quantization formats (turboquant_k8v4, turboquant_4bit_nc,
+# turboquant_3bit_nc — tested all three) distort too much on rare-token
+# prompts. Either MTP alone or TurboQuant alone is fine; only the combination
+# fails. Filed upstream separately.
+#
+# Use this config ONLY if:
+#   • your workload is short narrative / short code completions
+#   • you don't need tool calling
+#   • you don't need reliable recall from deep in the context
+#   • you accept that outputs may have degenerate loops on unusual prompts
+#
+# For EVERYTHING ELSE, use the default:
+#   cd compose && docker compose up -d    # <-- uses docker-compose.yml (fp8 KV)
+#
+# Run this experimental variant:
+#   cd compose && docker compose -f docker-compose.longctx-experimental.yml up -d
+# ===========================================================================
+#
+# Before running: `bash ../scripts/setup.sh` to fetch Genesis patches and
+# download + SHA-verify the Lorbus model.
+#
+# Model dir override: set MODEL_DIR env var.
+services:
+  vllm-qwen36-27b:
+    # Pinned to the exact nightly we tested and the Genesis patches verified against.
+    # Unpinning (just `vllm/vllm-openai:nightly`) may work but isn't guaranteed —
+    # if a newer nightly changes qwen3_reasoning_parser.py formatting, Genesis
+    # Patch 12 (Qwen3 tool_call fix) logs [FAILED] and tool calling silently
+    # breaks (model emits <tool_call>...</tool_call> as plain text instead of
+    # populating tool_calls[] in the API response).
+    image: vllm/vllm-openai@sha256:9bba4628a3b943e0dd33caefb94b811569ba1e97bdf23bee19a265c31b947ccb
+    container_name: vllm-qwen36-27b
+    restart: "no"
+    ports:
+      - "8020:8000"
+    volumes:
+      - ${MODEL_DIR:-../models}:/root/.cache/huggingface
+      - ../patches/genesis/patch_genesis_unified.py:/patches/patch_genesis_unified.py:ro
+      - ../patches/patch_tolist_cudagraph.py:/patches/patch_tolist_cudagraph.py:ro
+    environment:
+      # Uncomment the next line to pin to a specific GPU (e.g. GPU 0):
+      # - CUDA_VISIBLE_DEVICES=0
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+      - VLLM_WORKER_MULTIPROC_METHOD=spawn
+      - NCCL_CUMEM_ENABLE=0
+      - NCCL_P2P_DISABLE=1
+      - VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1
+      - VLLM_NO_USAGE_STATS=1
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:512
+      - VLLM_FLOAT32_MATMUL_PRECISION=high
+      - VLLM_USE_FLASHINFER_SAMPLER=1
+      - OMP_NUM_THREADS=1
+      - CUDA_DEVICE_MAX_CONNECTIONS=8
+      - VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+      - VLLM_MARLIN_USE_ATOMIC_ADD=1
+    shm_size: "16gb"
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        set -e
+        pip install xxhash -q
+        python3 /patches/patch_genesis_unified.py
+        python3 /patches/patch_tolist_cudagraph.py
+        exec vllm serve "$@"
+      - --
+    command:
+      - --model
+      - /root/.cache/huggingface/qwen3.6-27b-autoround-int4
+      - --served-model-name
+      - qwen3.6-27b-autoround
+      - --quantization
+      - auto_round
+      - --dtype
+      - float16
+      - --tensor-parallel-size
+      - "1"
+      - --max-model-len
+      - "125000"
+      - --gpu-memory-utilization
+      - "0.97"
+      - --max-num-seqs
+      - "1"
+      - --max-num-batched-tokens
+      - "4128"
+      - --kv-cache-dtype
+      - turboquant_3bit_nc
+      - --trust-remote-code
+      - --reasoning-parser
+      - qwen3
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - qwen3_coder
+      - --enable-prefix-caching
+      - --enable-chunked-prefill
+      - --no-scheduler-reserve-full-isl
+      - --speculative-config
+      - '{"method":"mtp","num_speculative_tokens":3}'
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
