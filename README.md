@@ -213,6 +213,32 @@ You edited `--max-num-batched-tokens`. Keep it ≥ 4128 for this context length 
 
 You probably have `--compilation-config.cudagraph_mode=none` somewhere. Remove it — our patch fixes the underlying bug, cudagraphs should stay on.
 
+### Tool calls return `<tool_call>{...}</tool_call>` as plain text (tool extraction doesn't fire)
+
+Check container logs for this line from the Genesis patcher:
+
+```
+[11/17] Qwen3 <tool_call> implicit reasoning end (PR #35687)...
+  [FAILED] Qwen3 tool_call fix
+```
+
+If you see `[FAILED]`, you're running a vLLM nightly that drifted past the anchor Genesis Patch 12 expects. Qwen3 emits `<think>...<tool_call>{...}</tool_call>` often **without** closing `</think>` first; without the patch, the reasoning parser eats the whole output as reasoning and never extracts the tool call → client sees `<tool_call>` as literal text.
+
+**Fix:** pin the image to the exact nightly we tested (already pinned by default in `compose/docker-compose.yml`):
+
+```yaml
+image: vllm/vllm-openai@sha256:9bba4628a3b943e0dd33caefb94b811569ba1e97bdf23bee19a265c31b947ccb
+```
+
+On that digest (vLLM `0.19.2rc1.dev21+g893611813`, built 2026-04-20), all four Qwen3 tool-call sub-patches apply cleanly — look for `[OK] Qwen3 tool_call fix` in the logs to confirm.
+
+If you need the floating `:nightly` tag for other reasons, verify the patch applied before trusting tool calls. You can force-replay the patch against a fresh container to see which anchor drifted:
+
+```bash
+docker run --rm --entrypoint python3 vllm/vllm-openai:nightly \
+  /patches/patch_genesis_unified.py 2>&1 | grep -E "Patch|FAILED|OK"
+```
+
 ---
 
 ## Repo layout
