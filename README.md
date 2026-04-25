@@ -118,11 +118,13 @@ That's it. The stack serves on `http://localhost:8020/v1/*` as a drop-in OpenAI-
 
 Three hurdles had to be cleared for this config to run on a single consumer 24 GB card:
 
-### 1. Lorbus's quant preserves `mtp.fc` as BF16
+### 1. The published int4-AutoRound quant preserves `mtp.fc` at full precision
 
 A vanilla `auto-round` run on Qwen3.6-27B packs the MTP fusion layer (`mtp.fc`) as INT4. In that form, vLLM's `Qwen3_5MTP` loader silently skips loading it (param name mismatch: expects `fc.weight`, finds `fc.qweight`). Result: MTP "loads" with zero parameters and produces **0% draft acceptance**.
 
-Lorbus's AutoRound release [dequantizes `mtp.fc` back to BF16 after quantization finishes](https://huggingface.co/Lorbus/Qwen3.6-27B-int4-AutoRound#mtp-fix--whats-different-from-a-vanilla-autoround-run). Adds ~100 MB, unlocks the full MTP speedup.
+Both [`Lorbus/Qwen3.6-27B-int4-AutoRound`](https://huggingface.co/Lorbus/Qwen3.6-27B-int4-AutoRound) and [`Intel/Qwen3.6-27B-int4-AutoRound`](https://huggingface.co/Intel/Qwen3.6-27B-int4-AutoRound) work around this — they ship `mtp.fc.weight` as a plain unquantized BF16 tensor. Lorbus does it implicitly (the `.weight` tensor is in the file with no explicit `extra_config` entry); Intel adds an explicit `mtp.fc: {bits: 16, data_type: fp}` to `extra_config`. Functionally identical: same 18 GB on disk, same 2013 tensors, same architecture, same INT4/group_size=128/auto_round packing. We use Lorbus because it's what we tested end-to-end; Intel's variant should be a drop-in if you prefer that source.
+
+Quick check that whichever quant you use has the fix: look for `mtp.fc.weight` (not `mtp.fc.qweight`) in the safetensors index.
 
 ### 2. Genesis patches bypass the TurboQuant hybrid gate
 
