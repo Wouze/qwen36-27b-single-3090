@@ -4,7 +4,10 @@
 
 Based on [`Lorbus/Qwen3.6-27B-int4-AutoRound`](https://huggingface.co/Lorbus/Qwen3.6-27B-int4-AutoRound) via vLLM with MTP speculative decoding + fp8_e5m2 KV cache. Built on [`Sandermage/genesis-vllm-patches`](https://github.com/Sandermage/genesis-vllm-patches) + a CUDA graph capture fix that ships in this repo.
 
-> 📖 **Write-up:** *[Qwen3.6-27B on a single RTX 3090 — the recipe](https://medium.com/)*
+> 📖 **Write-ups:**
+>  - *[Qwen3.6-27B on a single RTX 3090 — the recipe](https://medium.com/)* (the original)
+>  - *[Eight probes, one bug, one workaround](./articles/cudagraph-isolation.md)* (the investigation that surfaced after publication — living draft)
+>
 > 🐛 **Upstream bug reports:** [vllm-project/vllm#40807](https://github.com/vllm-project/vllm/issues/40807) (CUDA graph crash — worked around locally) · [vllm-project/vllm#40831](https://github.com/vllm-project/vllm/issues/40831) (TurboQuant × spec-decode output-quality, isolated to cudagraph capture; root cause TBD)
 
 ---
