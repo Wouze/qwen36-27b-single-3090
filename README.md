@@ -5,7 +5,8 @@
 Based on [`Lorbus/Qwen3.6-27B-int4-AutoRound`](https://huggingface.co/Lorbus/Qwen3.6-27B-int4-AutoRound) via vLLM with MTP speculative decoding + fp8_e5m2 KV cache. Built on [`Sandermage/genesis-vllm-patches`](https://github.com/Sandermage/genesis-vllm-patches) + a CUDA graph capture fix that ships in this repo.
 
 > 📖 **Write-up:** *[Qwen3.6-27B on a single RTX 3090 — the recipe](https://medium.com/)*
-> 🐛 **Upstream bug reports:** [vllm-project/vllm#40807](https://github.com/vllm-project/vllm/issues/40807) (CUDA graph crash — worked around locally) · [vllm-project/vllm#40831](https://github.com/vllm-project/vllm/issues/40831) (TurboQuant × any spec-decode output-quality bug — confirmed universal)
+> 🐛 **Upstream bug reports:** [vllm-project/vllm#40807](https://github.com/vllm-project/vllm/issues/40807) (CUDA graph crash — worked around locally) · [vllm-project/vllm#40831](https://github.com/vllm-project/vllm/issues/40831) (TurboQuant × spec-decode output-quality, isolated to cudagraph capture)
+> 🔧 **Likely upstream fix:** [vllm-project/vllm#40798](https://github.com/vllm-project/vllm/pull/40798) — when this lands, drop the `cudagraph_mode=NONE` workaround and TPS recovers to ~85+
 
 ---
 
@@ -266,9 +267,11 @@ We isolated the bug through six probes:
 - Probe 5 → disabling **both** torch.compile and cudagraph fixes the bug — compilation machinery is the culprit.
 - Probe 6 → disabling **only** cudagraph (keeping torch.compile inductor on) also fixes the bug — **isolating the bug to CUDA graph capture/replay specifically**.
 
-**The Triton kernels are correct when invoked dynamically. torch.compile inductor output is correct.** What corrupts the output is how the captured CUDA graph handles spec-decode's runtime shapes vs warmup-shape capture for the TurboQuant attention path. Probable specific cause: shape-specialized buffers like `_tq_mid_o_buf` are sized at `B = max_num_seqs` during pre-allocation but spec-decode verify routes through `_prefill_attention` with `B = q_len`, and the captured graph references buffer addresses that don't match runtime addresses.
+**The Triton kernels are correct when invoked dynamically. torch.compile inductor output is correct.** What corrupts the output is how the captured CUDA graph handles spec-decode's runtime shapes vs warmup-shape capture for the TurboQuant attention path. Specific cause (consistent with the symptoms; likely fixed by [PR #40798](https://github.com/vllm-project/vllm/pull/40798)): shape-specialized buffers like `_tq_mid_o_buf` are pre-allocated via `register_buffer(B=max_num_seqs=1)` but spec-decode verify routes through `_prefill_attention` with `B = q_len = 1+num_speculative_tokens`. The reuse logic reallocates a larger buffer and replaces `buf_holder._tq_mid_o_buf`, but the captured cudagraph from warmup still references the original `data_ptr`. Stale pointer → corrupted reads at replay → degenerate token loops or duplications depending on which addresses happen to be stale.
 
-The 125K compose ships `--compilation-config '{"cudagraph_mode":"NONE"}'` as the workaround. Cost: ~60% TPS (85 → 33 narrative). Drop the flag once upstream fixes the bug.
+PR #40798 moves these buffers to `WorkspaceManager.get_simultaneous()`, which returns persistent base-buffer views with a stable `data_ptr` that runtime spec-decode shapes can slice into without underlying address changes. If that's the right fix, this repo's cudagraph-off workaround becomes unnecessary and TPS recovers to ~85+.
+
+The 125K compose ships `--compilation-config '{"cudagraph_mode":"NONE"}'` as the interim workaround. Cost: ~60% TPS (85 → 33 narrative). Drop the flag once #40798 (or equivalent) lands.
 
 **What we're doing about it:**
 
@@ -372,11 +375,12 @@ qwen36-27b-single-3090/
 
 - **[#40069](https://github.com/vllm-project/vllm/issues/40069)** — TurboQuant/HIGGS follow-ups tracker (upstream). Lists "Speculative decoding / Eagle" and "Hybrid attention models" as unchecked.
 - **[#40807](https://github.com/vllm-project/vllm/issues/40807)** — our CUDA graph `.tolist()` crash; worked around locally via `patch_tolist_cudagraph.py`. Sandermage's [v7.10 Genesis tree](https://github.com/Sandermage/genesis-vllm-patches) reaches the same end state via pre-allocation (Patches 23 + 44).
-- **[#40831](https://github.com/vllm-project/vllm/issues/40831)** — our TurboQuant × spec-decode output-quality bug. Six-probe ladder isolates it to **CUDA graph capture/replay** (probe 6: cudagraph off, torch.compile on → all tests pass at 33 TPS). Workaround: `--compilation-config '{"cudagraph_mode":"NONE"}'`, applied automatically in `docker-compose.longctx-experimental.yml`.
-- vLLM PR: not yet submitted — both issues need upstream fixes. Our patches are short-term workarounds.
+- **[#40831](https://github.com/vllm-project/vllm/issues/40831)** — our TurboQuant × spec-decode output-quality bug. Six-probe ladder + Sander's independent confirmation isolate it to **CUDA graph capture/replay** (probe 6: cudagraph off, torch.compile on → all 9 prompts pass at 33 TPS, including Sander's `tool_call_simple` / `code_quicksort` / `structured_xml` failure cases). Workaround: `--compilation-config '{"cudagraph_mode":"NONE"}'`, applied automatically in `docker-compose.longctx-experimental.yml`.
+- **[PR #40798](https://github.com/vllm-project/vllm/pull/40798)** — *expected upstream fix.* Moves `_tq_mid_o_buf` / `_tq_output_buf` / `_tq_lse_buf` from per-layer `register_buffer(B=max_num_seqs)` to `WorkspaceManager.get_simultaneous()` (persistent base-buffer with stable `data_ptr`). This closes the pointer-drift between warmup-shape capture (`B=1`) and runtime-shape replay (`B=q_len`) that we suspect causes #40831. When this PR merges, expect the `cudagraph_mode=NONE` workaround to become unnecessary and TPS to recover from 33 → 85+.
+- **Sandermage's [P56](https://github.com/Sandermage/genesis-vllm-patches/blob/main/vllm/_genesis/wiring/patch_56_spec_decode_decode_path_guard.py)** — routing-layer workaround (architecturally equivalent to our Probe 4 patch). Marked superseded by our `cudagraph_mode=NONE` workaround since it only addresses the catastrophic surface, not the underlying pointer drift.
 - Sandermage Genesis: we may contribute `patch_tolist_cudagraph.py` to their unified script. They have offered to extract Patches 23 + 44 to upstream.
 
-Once upstream resolves #40831, the long-ctx compose drops the `cudagraph_mode=NONE` flag and TPS should recover from 33 → 85+. Until then: fp8_e5m2 + MTP at 20K (default) is the fast option, cudagraph-off + turboquant + MTP at 125K (long-ctx variant) is the long-context option, both fully functional.
+Once upstream resolves #40831 (likely via #40798), the long-ctx compose drops the `cudagraph_mode=NONE` flag and TPS should recover from 33 → 85+. Until then: fp8_e5m2 + MTP at 20K (default) is the fast option, cudagraph-off + turboquant + MTP at 125K (long-ctx variant) is the long-context option, both fully functional.
 
 ---
 
