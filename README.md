@@ -4,32 +4,18 @@
 
 Based on [`Lorbus/Qwen3.6-27B-int4-AutoRound`](https://huggingface.co/Lorbus/Qwen3.6-27B-int4-AutoRound) via vLLM with MTP speculative decoding + fp8_e5m2 KV cache. Built on [`Sandermage/genesis-vllm-patches`](https://github.com/Sandermage/genesis-vllm-patches) + a CUDA graph capture fix that ships in this repo.
 
-> 📖 **Write-ups:**
->  - *[Qwen3.6-27B on a single RTX 3090 — the recipe](https://medium.com/)* (the original)
->  - *[Eight probes, one bug, one workaround](./articles/cudagraph-isolation.md)* (the investigation that surfaced after publication — living draft)
->
+> 📖 **Write-up:** *[Qwen3.6-27B on a single RTX 3090 — the recipe](https://medium.com/)*
 > 🐛 **Upstream bug reports:** [vllm-project/vllm#40807](https://github.com/vllm-project/vllm/issues/40807) (CUDA graph crash — worked around locally) · [vllm-project/vllm#40831](https://github.com/vllm-project/vllm/issues/40831) (TurboQuant × spec-decode output-quality, isolated to cudagraph capture; root cause TBD)
 
 ---
 
-## About the 125K context headline (now functional via cudagraph workaround)
+## About the 125K context headline
 
-The [original write-up](https://medium.com/) reported 85–106 TPS at **125K context** using TurboQuant KV cache. Under broader functional testing since publication, we found that the originally-shipped 125K config produces **degenerate token loops on tool calls, long-context recall, and (occasionally) streaming**. Six probes traced the failure to **vLLM's CUDA graph capture/replay machinery for spec-decode + TurboQuant**, not the kernels or the attention math:
+The [original write-up](https://medium.com/) reported 85–106 TPS at 125K context using TurboQuant KV. Under broader functional testing since publication we found that the originally-shipped 125K config produces degenerate token loops on tool calls, long-context recall, and occasionally streaming. An eight-probe investigation traced the failure to **vLLM's CUDA graph capture/replay machinery for spec-decode + TurboQuant** — not the kernels, not torch.compile inductor output, not attention math. Filed upstream as [#40831](https://github.com/vllm-project/vllm/issues/40831); root cause within the cudagraph layer is still TBD upstream. Full probe ladder + analysis in the [Technical background](#technical-background--why-the-long-ctx-config-disables-cudagraph) section below.
 
-| probe | turboquant | spec-dec | cudagraph | torch.compile | result | TPS |
-|---|---|---|---|---|---|---|
-| 1 | ✅ | ❌ | ✅ | ✅ | ✅ | 40 |
-| 2 | ✅ | ngram | ✅ | ✅ | ✗ loops | -- |
-| 3 (MiMo dense) | ✅ | MTP n=1 | ✅ | ✅ | ✗ collapse | -- |
-| 4 | ✅ | MTP | ✅ | + threshold=0 | ✗ | -- |
-| 5 | ✅ | MTP | ❌ | ❌ | ✅ | 23 |
-| **6** | ✅ | MTP | **❌** | ✅ | **✅** | **33** |
+The shipped workaround: `--compilation-config '{"cudagraph_mode":"NONE"}'` (disables CUDA graph capture, keeps torch.compile inductor on). Cost: ~60% TPS (85 → 33 narrative). Restores correctness across tool calls, recall, and streaming. Baked into `docker-compose.longctx-experimental.yml` so that file ships a functional 125K config rather than the originally-broken one. When upstream lands a fix, drop the flag and TPS recovers.
 
-Probe 6 is the workable cut: **`--compilation-config '{"cudagraph_mode":"NONE"}'`** disables only CUDA graph capture, keeps torch.compile inductor on. All 7 verify-full.sh tests pass. TPS drops from ~85 (broken) to ~33 (correct), but 125K context + tools + recall + vision actually work.
-
-This workaround is now baked into `docker-compose.longctx-experimental.yml` so that file ships a **functional** 125K config rather than the original broken one. When upstream fixes [#40831](https://github.com/vllm-project/vllm/issues/40831), drop the cudagraph-off flag and TPS recovers.
-
-**The default config (`docker-compose.yml`) is unchanged** — MTP n=3 + fp8_e5m2 KV + vision at 20K, ~85 TPS peak. Use the long-context variant when you actually need the 125K KV pool and can pay the 60% TPS cost.
+**The default config (`docker-compose.yml`) is unchanged** — MTP n=3 + fp8_e5m2 KV + vision at 20K, ~85 TPS peak, no workaround needed (fp8 KV doesn't go through TurboQuant's custom backend). Use the long-context variant when you actually need the 125K KV pool and can pay the TPS cost.
 
 ---
 
@@ -76,9 +62,9 @@ All three configs now pass every test. The 125K variant pays a ~60% TPS cost for
 
 Beats [Lorbus card's RTX 5090 baseline](https://huggingface.co/Lorbus/Qwen3.6-27B-int4-AutoRound) (~60 TPS) on consumer Ampere hardware. All functionality verified.
 
-For higher TPS at the cost of broken tools and unreliable recall, see `docker-compose.longctx-experimental.yml` (92/95 TPS, 125K ctx pool, quality caveats documented in file header).
+For more context without vision (text-only agents), see `docker-compose.tools-text.yml` — 75K ctx, same TPS.
 
-For more context without vision (text-only agents), see `docker-compose.tools-text.yml` (75K ctx, same TPS).
+For 125K ctx with vision + tools + recall, see `docker-compose.longctx-experimental.yml` — 33 TPS sustained (cudagraph-off workaround for [#40831](https://github.com/vllm-project/vllm/issues/40831); flag drops out and TPS recovers when upstream lands a fix).
 
 ---
 
@@ -228,7 +214,7 @@ Expected numbers on a stock 3090 at 230W:
 | narrative (warmed) | 10–16 s | 60–105 |
 | code (warmed) | 8–12 s | 60–100 |
 
-The 125K variant runs at a more uniform ~33 TPS because it's eager-mode for cudagraph; spec-decode acceptance dips don't compound with cudagraph variance.
+The 125K variant runs at a more uniform ~33 TPS because it disables CUDA graph capture (`cudagraph_mode=NONE`) while keeping torch.compile inductor on; spec-decode acceptance dips don't compound with cudagraph variance.
 
 ---
 
@@ -350,7 +336,10 @@ qwen36-27b-single-3090/
 ├── LICENSE                                     Apache-2.0
 ├── .gitignore
 ├── patches/
-│   ├── patch_tolist_cudagraph.py               our CUDA graph capture fix
+│   ├── patch_tolist_cudagraph.py               our CUDA graph capture crash fix (#40807)
+│   ├── patch_pr40798_workspace.py              research artifact — backports vllm#40798;
+│   │                                            does NOT fix #40831 (probe 8); kept for
+│   │                                            reproducibility of the negative result
 │   └── genesis/                                (gitignored; fetched by setup.sh)
 ├── compose/
 │   ├── docker-compose.yml                      DEFAULT — MTP + fp8 + vision, 20K, ~85 TPS
@@ -390,11 +379,12 @@ Until upstream lands a fix: fp8_e5m2 + MTP at 20K (default) is the fast option, 
 
 - **Qwen team** (@Alibaba_Qwen) — for the base model and a usable MTP head architecture
 - **Lorbus** — for the AutoRound INT4 quant with preserved BF16 `mtp.fc`
-- **Sandermage** — for the Genesis patch set that made TurboQuant work on hybrid models
+- **[Sandermage](https://github.com/Sandermage/genesis-vllm-patches)** — for the Genesis patch set that made TurboQuant work on hybrid models on consumer Ampere; for independently reproducing #40831 on a different rig (2× A5000 + Qwen3-Next-35B-A3B-FP8 + ngram), confirming the cudagraph-off workaround, and engaging honestly with each negative result during the probe ladder
+- **[vibhavagarwal5](https://github.com/vllm-project/vllm/pull/38479)** — for the original TurboQuant landing PR and the [tracking issue #40069](https://github.com/vllm-project/vllm/issues/40069) that made the spec-decode-unverified status visible upfront
 - **vLLM project** — for shipping TurboQuant and actively maintaining the backend
 - **Intel AutoRound** — for the quantization framework
 
-Our contribution here is `patch_tolist_cudagraph.py`, the article linking it all together, and this reproducible recipe. Everything else is brilliant work by people we stand on the shoulders of.
+Our contribution here is `patch_tolist_cudagraph.py`, the original write-up linking it all together, and this reproducible recipe. Everything else is brilliant work by people we stand on the shoulders of.
 
 ---
 
