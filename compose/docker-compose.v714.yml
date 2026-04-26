@@ -1,0 +1,144 @@
+# ===========================================================================
+# Single-card Qwen3.6-27B + Genesis v7.14 + TurboQuant_3bit_nc + MTP n=3.
+#
+# This is the surgical fix for the silent tool-call cascade bug
+# (vllm-project/vllm#40880) that the older `docker-compose.yml` and
+# `docker-compose.longctx-experimental.yml` paths exhibit.
+#
+# What v7.14 changes vs old Genesis:
+#   - P65 forces cudagraph_mode=PIECEWISE for spec-decode (MTP runs eager
+#     continuation → correct math, tool calls populate tool_calls[] cleanly)
+#   - P66 filters cudagraph capture sizes for spec-decode divisibility
+#   - P64 fixes streaming MTP tool-call edge case
+#   - P68/P69 long-ctx tool-format adherence (env-opt-in)
+#
+# Trade-off vs the old fast path:
+#   - Tool calls now WORK (was silently broken — `<tool_call>` cascade)
+#   - Per-stream TPS regresses ~25%: 55-72 TPS at 32K vs old 92-95 TPS at 125K
+#   - max-model-len had to drop to 32K on consumer 24 GB to leave activation
+#     headroom (eager continuation needs more VRAM than FULL cudagraph did)
+#
+# Pick this variant if you need WORKING TOOL CALLS on a single 3090 with
+# spec-decode. If you only need plain chat / code generation without tools,
+# the old `docker-compose.yml` (FULL cudagraph) is faster — but verify with
+# `bash scripts/verify-full.sh` that your workload doesn't trigger the
+# cascade bug.
+#
+# Variant matrix:
+#
+#   docker-compose.yml             (default)   20K   66/84 TPS  vision    ✓
+#   docker-compose.tools-text.yml              75K   65/84 TPS  no vis    ✓
+#   docker-compose.longctx-experimental.yml   125K     33 TPS   vision    ✓ (cudagraph_mode=NONE workaround)
+#   docker-compose.v714.yml                    32K  55-72 TPS   vision    ✓ (THIS — Genesis v7.14 P65 surgical fix)
+#
+# Upstream tracker: vllm-project/vllm#40880 (Sandermage's root-cause + v7.14
+# patches). Proper kernel fix (P67) designed-but-not-implemented; v7.14 is
+# a workaround until that lands.
+#
+# Run with:
+#   bash ../scripts/setup.sh    # ensures Genesis tree at v7.14+ layout
+#   cd compose && docker compose -f docker-compose.v714.yml up -d
+# ===========================================================================
+services:
+  vllm-qwen36-27b:
+    image: vllm/vllm-openai:nightly
+    container_name: vllm-qwen36-27b
+    restart: "no"
+    ports:
+      - "8020:8000"
+    volumes:
+      - ${MODEL_DIR:-../models}:/root/.cache/huggingface
+      # Genesis v7.14 modular package (mounted into vLLM's site-packages).
+      # Apply via `python3 -m vllm._genesis.patches.apply_all` at boot.
+      - ../patches/genesis/vllm/_genesis:/usr/local/lib/python3.12/dist-packages/vllm/_genesis:ro
+      # Standalone .tolist() cudagraph capture fix — separate bug from P65.
+      # Different bug class: P65 fixes cu_seqlens_k=cu_seqlens_q misclassification;
+      # this fix guards .tolist() syscalls during capture.
+      - ../patches/genesis/patch_tolist_cudagraph.py:/patches/patch_tolist_cudagraph.py:ro
+    environment:
+      # Uncomment the next line to pin to a specific GPU (e.g. GPU 0):
+      # - CUDA_VISIBLE_DEVICES=0
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+      - VLLM_WORKER_MULTIPROC_METHOD=spawn
+      - NCCL_CUMEM_ENABLE=0
+      - NCCL_P2P_DISABLE=1
+      - VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1
+      - VLLM_NO_USAGE_STATS=1
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:512
+      - VLLM_FLOAT32_MATMUL_PRECISION=high
+      - VLLM_USE_FLASHINFER_SAMPLER=1
+      - OMP_NUM_THREADS=1
+      - CUDA_DEVICE_MAX_CONNECTIONS=8
+      - VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+      - VLLM_MARLIN_USE_ATOMIC_ADD=1
+      # Genesis v7.14 opt-in patches — these are OFF by default and must be
+      # enabled per-process. Without these, v7.14 produces the same cudagraph
+      # behavior as v7.13 (silent tool-call cascade).
+      - GENESIS_ENABLE_P65_TURBOQUANT_SPEC_CG_DOWNGRADE=1   # core fix for #40880
+      - GENESIS_ENABLE_P66_CUDAGRAPH_SIZE_FILTER=1           # capture-size divisibility
+      - GENESIS_ENABLE_P64_QWEN3CODER_MTP_STREAMING=1        # streaming tool-call edge case
+      - GENESIS_ENABLE_P68_AUTO_FORCE_TOOL=1                 # long-ctx tool adherence
+      - GENESIS_ENABLE_P69_LONG_CTX_TOOL_REMINDER=1
+    shm_size: "16gb"
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        set -e
+        pip install xxhash pandas scipy -q
+        python3 -m vllm._genesis.patches.apply_all
+        python3 /patches/patch_tolist_cudagraph.py
+        exec vllm serve "$@"
+      - --
+    command:
+      - --model
+      - /root/.cache/huggingface/qwen3.6-27b-autoround-int4
+      - --served-model-name
+      - qwen3.6-27b-autoround
+      - --quantization
+      - auto_round
+      - --dtype
+      - float16
+      - --tensor-parallel-size
+      - "1"
+      # 32K — this is the practical ceiling on consumer 24 GB Ampere with
+      # v7.14's eager spec-verify. The old longctx-experimental compose hit
+      # 125K because FULL cudagraph captured activation tensors once and
+      # reused them; v7.14's PIECEWISE re-allocates each call → less ctx room.
+      - --max-model-len
+      - "32768"
+      - --gpu-memory-utilization
+      - "0.92"
+      - --max-num-seqs
+      - "1"
+      - --max-num-batched-tokens
+      - "4128"
+      - --kv-cache-dtype
+      - turboquant_3bit_nc
+      - --trust-remote-code
+      - --reasoning-parser
+      - qwen3
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - qwen3_coder
+      - --enable-prefix-caching
+      - --enable-chunked-prefill
+      - --no-scheduler-reserve-full-isl
+      - --speculative-config
+      - '{"method":"mtp","num_speculative_tokens":3}'
+      # cudagraph_mode is NOT forced here. Genesis v7.14 P65 auto-downgrades
+      # FULL_AND_PIECEWISE → PIECEWISE for spec-decode at runtime. 1-token
+      # decode batches still get cudagraph capture; only K+1 spec-verify
+      # batches go eager.
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"

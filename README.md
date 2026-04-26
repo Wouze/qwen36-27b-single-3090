@@ -12,20 +12,36 @@ Based on [`Lorbus/Qwen3.6-27B-int4-AutoRound`](https://huggingface.co/Lorbus/Qwe
 
 ## Status at a glance
 
-Three configurations, **all functional today**. Pick the one that matches your workload.
+Four configurations, all functional. Pick by workload — there's a real per-stream-TPS-vs-tool-correctness tradeoff because of [vllm#40880](https://github.com/vllm-project/vllm/issues/40880) (the silent MTP × TurboQuant tool-call cascade bug).
 
-| Variant | Context | TPS (narrative / peak) | Vision | Caveats |
-|---|---|---|---|---|
-| **Default** (`docker-compose.yml`) | 20K | 66 / 85 | ✅ | None — recommended for most workloads |
-| **Tools-text** (`docker-compose.tools-text.yml`) | 75K | 65 / 85 | ❌ | Drops vision to free KV pool |
-| **Long-context** (`docker-compose.longctx-experimental.yml`) | 125K | 33 sustained | ✅ | ~60% TPS cost — ships `cudagraph_mode=NONE` as a workaround for [vllm#40831](https://github.com/vllm-project/vllm/issues/40831); flag drops out + TPS recovers when upstream lands a fix |
+| Variant | Context | TPS narr/peak | Vision | Tools | Notes |
+|---|---|---|---|---|---|
+| **Default** (`docker-compose.yml`) — fp8 KV + MTP | 20K | 66 / 85 | ✅ | ✅ | fp8 KV sidesteps the cudagraph bug entirely. Recommended for ≤20K workloads. |
+| **Tools-text** (`docker-compose.tools-text.yml`) — fp8 + 75K | 75K | 65 / 85 | ❌ | ✅ | Drops vision to free KV pool. fp8 KV — bug doesn't fire. |
+| **Legacy long-ctx** (`docker-compose.longctx-experimental.yml`) — TurboQuant + cudagraph_mode=NONE | 125K | ~33 | ✅ | ✅ | TurboQuant 3-bit. Ships `cudagraph_mode=NONE` workaround → -65% TPS, full correctness. |
+| **v7.14** (`docker-compose.v714.yml`) — TurboQuant + Genesis v7.14 P65 ⭐ | 32K | 55-72 | ✅ | ✅ | Surgical workaround. P65 auto-downgrades cudagraph for spec-decode only. -25% from old fast path. |
+| ~~**Old fast path**~~ — TurboQuant + FULL cudagraph | ~~125K~~ | ~~92-95~~ | ✅ | **✗ silently broken** | Not shipped as a compose. Tool calls produce `<tool_call>` cascade. Hidden from plain TPS measurement. |
+
+### Decision tree
+
+- **Need 20K ctx, full features?** → Default. No reason to look further.
+- **Need long ctx (>32K) + tool calls + decent TPS?** → **v7.14** (32K — practical limit on consumer 24 GB with v7.14's PIECEWISE spec-verify).
+- **Need 125K ctx + tool calls, OK with low TPS?** → Legacy long-ctx (`cudagraph_mode=NONE`).
+- **Need 75K ctx + tools but no vision?** → Tools-text.
+- **Plain chat / code generation, no tool calls, max TPS?** → The "old fast path" *technically* exists (use legacy long-ctx compose with `--compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE"}'`) — but verify your workload via `bash scripts/verify-full.sh` first because the tool-call bug fires silently.
+
+### What v7.14 changes (the new variant)
+
+[Sandermage's v7.14](https://github.com/Sandermage/genesis-vllm-patches) shipped 2026-04-25 with the P65 patch root-causing #40880: `TurboQuantAttentionImpl._prefill_attention`'s cudagraph-capture bypass treats spec-decode K+1 verify batches as first-chunk prefill (sets `cu_seqlens_k = cu_seqlens_q`), so the captured kernel ignores cached KV. Drafter and verifier both produce noise from the kernel-without-context path; for tool-call prompts they converge on the same high-bias special token (`<tool_call>`) and cascade.
+
+P65 downgrades `_cudagraph_support` from `UNIFORM_BATCH` to `UNIFORM_SINGLE_TOKEN_DECODE`. vLLM's compilation auto-detects and forces `cudagraph_mode=PIECEWISE` for spec-decode → eager continuation runs the correct branch. 1-token decode batches still get piecewise capture; only K+1 spec-verify batches go eager.
+
+This is a workaround. The proper fix is a custom multi-query Triton kernel (P67) that handles K+1 query against compressed cached KV under cudagraph capture — designed-but-not-implemented in v7.14.
 
 ### What's NOT working today
 
-- **125K context at full TPS (~85+)** — blocked on upstream cudagraph-capture bug [vllm#40831](https://github.com/vllm-project/vllm/issues/40831). Root cause within the cudagraph layer is still TBD upstream. Our long-context variant ships a working workaround at the cost of ~60% TPS; details in [Technical background](#technical-background--whats-broken-upstream-and-why-we-work-around-it) below.
+- **125K context at FULL cudagraph speed (~95 TPS) WITH tool calls** — that combination requires the proper P67 kernel. Until then, you pick two of three: long ctx, full TPS, working tools.
 - **GGUF on vLLM for Qwen3-Next family** — not supported upstream yet (4 PRs open + a missing port of `Qwen35TensorProcessor` value transforms). Use llama.cpp / Ollama if you specifically need GGUF.
-
-**TL;DR:** if you only need ≤20K context, run the default and ignore the rest of this README — it works.
 
 ---
 
