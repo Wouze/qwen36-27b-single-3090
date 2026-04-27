@@ -1,10 +1,9 @@
 """
-Disk-edit patch for turboquant_attn.py: fix CUDA graph capture crashes
-at `.tolist()` calls inside the backend.
+Disk-edit patch for vllm/v1/attention/backends/turboquant_attn.py: fix CUDA
+graph capture crashes at `.tolist()` calls inside the backend.
 
-There are two sites in turboquant_attn.py that force GPU->CPU syncs via
-`.tolist()` inside code paths that can execute under active CUDA stream
-capture:
+There are two sites that force GPU->CPU syncs via `.tolist()` inside code
+paths that can execute under active CUDA stream capture:
 
   A) forward() mixed-batch branch:
        prefill_max_seq = max(attn_metadata.seq_lens[num_decodes:].tolist())
@@ -28,50 +27,77 @@ Fix:
      only drive memory profiling, not graph content. At inference (non-
      capture), the original correct continuation path runs.
 
-Runs AFTER Genesis patches (text anchors verified to survive Genesis's
-disk edits — Genesis does not touch either tolist site).
+This patcher discovers vLLM's install path via `import vllm` so it works on
+docker (`dist-packages`) AND host venvs (`site-packages`). Uses small,
+whitespace-tolerant regex anchors so it survives upstream nightly-to-nightly
+churn around the patched lines.
+
+Genesis v7.x ships an attribution-credited backport as P78
+(`patch_78_tolist_capture_guard.py`); if you're already loading the Genesis
+tree with `GENESIS_ENABLE_P78_TOLIST_CAPTURE_GUARD=1` you can skip this
+patcher. They patch the same line — running both is harmless (idempotent
+guard), running just one is sufficient.
+
+Runs AFTER Genesis patches (Site B's anchor survives Genesis's disk edits;
+Site A is in a different function Genesis doesn't touch).
 """
 
 import logging
 import os
+import re
 
 log = logging.getLogger("tolist_cudagraph_fix")
 log.setLevel(logging.INFO)
 if not log.handlers:
     log.addHandler(logging.StreamHandler())
 
-TARGET = (
-    "/usr/local/lib/python3.12/dist-packages/"
-    "vllm/v1/attention/backends/turboquant_attn.py"
+PATCH_TAG = "[tolist_cudagraph_fix]"
+
+
+def _find_target():
+    """Auto-discover turboquant_attn.py via vllm import.
+
+    Falls back to common docker path if import fails (e.g. when this script
+    is invoked outside the vLLM venv but the file path is known).
+    """
+    try:
+        import vllm
+        vllm_dir = os.path.dirname(vllm.__file__)
+        path = os.path.join(vllm_dir, "v1/attention/backends/turboquant_attn.py")
+        if os.path.exists(path):
+            return path
+    except ImportError:
+        pass
+
+    # Fallbacks for non-imported invocation
+    fallbacks = [
+        "/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/turboquant_attn.py",
+        "/usr/lib/python3.12/site-packages/vllm/v1/attention/backends/turboquant_attn.py",
+    ]
+    for path in fallbacks:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+# Site B: insert capture-guard early-return at the START of the
+# `_prefill_attention` function body. Anchor on `N, Hq, D = query.shape`
+# which is the first executable line in the function body (and unique in
+# the file). We insert immediately AFTER this line.
+SITE_B_ANCHOR_RE = re.compile(
+    r"^(        N, Hq, D = query\.shape\n)",
+    re.MULTILINE,
 )
 
-# Site B: _prefill_attention continuation branch (crash we actually hit).
-# Anchor spans from the comment block above Hk through both tolist calls.
-SITE_B_OLD = """        # Continuation or no flash_attn: per-request attention.
-        # For continuation chunks (seq_len > q_len), we must attend to
-        # previously cached K/V from the TQ cache, not just the current
-        # chunk's raw K/V.
-        Hk = key.shape[1]
-        use_gqa = Hk < Hq
-        query_start_loc = attn_metadata.query_start_loc
-        num_reqs = query_start_loc.shape[0] - 1
-
-        output = torch.zeros(N, Hq, D, device=query.device, dtype=query.dtype)
-
-        # Convert to Python lists once (single CPU-GPU sync) instead of
-        # per-request .item() calls that each force a sync.
-        qsl = query_start_loc.tolist()
-        seq_lens_list = attn_metadata.seq_lens.tolist()"""
-
-SITE_B_NEW = """        # [tolist_cudagraph_fix] During CUDA graph capture, the continuation
-        # branch below calls .tolist() which forces a GPU->CPU sync -- illegal
-        # under torch.cuda.graph(). vLLM V1 PIECEWISE mode lists
+SITE_B_INSERT = """
+        # %s During CUDA graph capture, the continuation branch below calls
+        # .tolist() which forces a GPU->CPU sync — illegal under
+        # torch.cuda.graph(). vLLM V1 PIECEWISE mode lists
         # unified_attention_with_output as a splitting_op, so the captured
         # piece does not include attention outputs; capture-time values only
         # need to drive memory profiling. Fall back to the graph-safe fast
-        # path (same shape output (N,Hq,D), similar workspace). At inference
-        # (non-capture), is_current_stream_capturing() returns False and the
-        # original per-request continuation path runs unchanged.
+        # path. At inference (non-capture), is_current_stream_capturing()
+        # returns False and the original continuation path runs unchanged.
         if torch.cuda.is_current_stream_capturing():
             if _HAS_FLASH_ATTN:
                 return flash_attn_varlen_func(
@@ -86,80 +112,81 @@ SITE_B_NEW = """        # [tolist_cudagraph_fix] During CUDA graph capture, the 
                     causal=True,
                 )
             return torch.zeros(N, Hq, D, device=query.device, dtype=query.dtype)
-
-        # Continuation or no flash_attn: per-request attention.
-        # For continuation chunks (seq_len > q_len), we must attend to
-        # previously cached K/V from the TQ cache, not just the current
-        # chunk's raw K/V.
-        Hk = key.shape[1]
-        use_gqa = Hk < Hq
-        query_start_loc = attn_metadata.query_start_loc
-        num_reqs = query_start_loc.shape[0] - 1
-
-        output = torch.zeros(N, Hq, D, device=query.device, dtype=query.dtype)
-
-        # Convert to Python lists once (single CPU-GPU sync) instead of
-        # per-request .item() calls that each force a sync.
-        qsl = query_start_loc.tolist()
-        seq_lens_list = attn_metadata.seq_lens.tolist()"""
+""" % PATCH_TAG
 
 # Site A: forward() mixed-batch prefill_max_seq tolist.
-SITE_A_OLD = """            # Use CPU-side max to avoid GPU→CPU sync from .item()
-            prefill_max_seq = max(attn_metadata.seq_lens[num_decodes:].tolist())"""
+# Single-line anchor — `prefill_max_seq = max(...)` is unique in the file.
+SITE_A_OLD_RE = re.compile(
+    r"^(            prefill_max_seq = max\(attn_metadata\.seq_lens\[num_decodes:\]\.tolist\(\)\))$",
+    re.MULTILINE,
+)
 
-SITE_A_NEW = """            # Use CPU-side max to avoid GPU→CPU sync from .item()
-            # [tolist_cudagraph_fix] During CUDA graph capture, substitute a
-            # safe upper bound (batch-level max_seq_len, a Python int) to
-            # avoid the tolist() sync. Overestimates prefill_max_seq but
-            # flash_attn uses it only as a grid upper bound, and real
-            # inference (non-capture) takes the else branch unchanged.
-            if torch.cuda.is_current_stream_capturing():
-                prefill_max_seq = attn_metadata.max_seq_len
-            else:
-                prefill_max_seq = max(attn_metadata.seq_lens[num_decodes:].tolist())"""
+SITE_A_NEW_TEMPLATE = (
+    "            # %s During CUDA graph capture, substitute a safe upper\n"
+    "            # bound (batch-level max_seq_len, a Python int) to avoid the\n"
+    "            # tolist() sync. Overestimates prefill_max_seq but flash_attn\n"
+    "            # uses it only as a grid upper bound; non-capture takes else.\n"
+    "            if torch.cuda.is_current_stream_capturing():\n"
+    "                prefill_max_seq = attn_metadata.max_seq_len\n"
+    "            else:\n"
+    r"    \1"
+) % PATCH_TAG
 
 
-def _apply(label, src, old, new):
-    if old not in src:
-        log.error(
-            "[tolist_cudagraph_fix] %s anchor NOT FOUND -- patch NOT applied. "
-            "Upstream may have changed or Genesis rewrote this area.",
-            label,
-        )
-        return src, False
-    return src.replace(old, new), True
+def _apply_site_b(src):
+    if PATCH_TAG in src:
+        return src, "skip-already-applied"
+    m = SITE_B_ANCHOR_RE.search(src)
+    if not m:
+        return src, "anchor-not-found"
+    return src[: m.end()] + SITE_B_INSERT + src[m.end():], "applied"
+
+
+def _apply_site_a(src):
+    if SITE_A_OLD_RE.search(src) is None:
+        return src, "anchor-not-found"
+    if PATCH_TAG in src and "prefill_max_seq = attn_metadata.max_seq_len" in src:
+        return src, "skip-already-applied"
+    return SITE_A_OLD_RE.sub(SITE_A_NEW_TEMPLATE, src, count=1), "applied"
 
 
 def main():
-    if not os.path.exists(TARGET):
-        log.error(f"[tolist_cudagraph_fix] target missing: {TARGET}")
-        return
+    target = _find_target()
+    if target is None:
+        log.error("%s vLLM turboquant_attn.py not found via import or fallbacks", PATCH_TAG)
+        return 1
+    log.info("%s target: %s", PATCH_TAG, target)
 
-    with open(TARGET, "r") as f:
+    with open(target, "r") as f:
         src = f.read()
+    original_src = src
 
-    if "[tolist_cudagraph_fix]" in src:
-        log.info("[tolist_cudagraph_fix] already applied (idempotent)")
-        return
+    if PATCH_TAG in src:
+        log.info("%s already applied (idempotent)", PATCH_TAG)
+        return 0
 
-    applied_any = False
-    src, ok_b = _apply("Site B (_prefill_attention)", src, SITE_B_OLD, SITE_B_NEW)
-    applied_any = applied_any or ok_b
-    src, ok_a = _apply("Site A (forward mixed-batch)", src, SITE_A_OLD, SITE_A_NEW)
-    applied_any = applied_any or ok_a
+    src, status_b = _apply_site_b(src)
+    log.info("%s Site B (_prefill_attention): %s", PATCH_TAG, status_b)
+    src, status_a = _apply_site_a(src)
+    log.info("%s Site A (forward mixed-batch): %s", PATCH_TAG, status_a)
 
-    if applied_any:
-        with open(TARGET, "w") as f:
-            f.write(src)
-        log.info(
-            "[tolist_cudagraph_fix] Patched %s. Site A: %s, Site B: %s",
-            TARGET,
-            "ok" if ok_a else "skip",
-            "ok" if ok_b else "skip",
+    if src == original_src:
+        log.error(
+            "%s NO sites patched — file unchanged. "
+            "Sites: A=%s B=%s. Either upstream changed beyond our anchor "
+            "tolerance, or Genesis P78 already supplies the equivalent guard.",
+            PATCH_TAG, status_a, status_b,
         )
-    else:
-        log.error("[tolist_cudagraph_fix] NO sites patched -- file not modified")
+        return 1
+
+    with open(target, "w") as f:
+        f.write(src)
+    log.info(
+        "%s Patched %s. Site A=%s, Site B=%s",
+        PATCH_TAG, target, status_a, status_b,
+    )
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
